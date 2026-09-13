@@ -59,48 +59,63 @@ def calculate_rsi(series, period=14):
 # --- メイン分析処理 ---
 def analyze_stock(symbol, evaluation_mode):
     try:
+        # Tickerデータ取得
         stock = yf.Ticker(symbol)
-        
-        # データ取得（エラー回避処理を追加）
         hist = stock.history(period="6m")
-        if hist is None or hist.empty or len(hist) < 10:
-            return None, f"データが取得できませんでした。銘柄コード ({symbol}) を再確認してください。"
-        
-        # 列構造の平坦化（MultiIndex対策）
-        if isinstance(hist.columns, pd.MultiIndex):
-            hist.columns = hist.columns.get_level_values(0)
-            
-        # 必須列の存在確認
-        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        if not all(col in hist.columns for col in required_cols):
-            return None, "必要な価格データ（OHLCV）が含まれていません。"
 
-        # 移動平均線・RSI
+        # 1. データ存在チェック
+        if hist is None or hist.empty:
+            return None, f"銘柄コード ({symbol}) の株価データを取得できませんでした。コードを確認してください。"
+
+        # 2. yfinanceのMultiIndex構造を確実に単一層へ平坦化
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = [col[0] for col in hist.columns]
+
+        # 3. 列名の標準化と必須列チェック
+        hist = hist.loc[:, ~hist.columns.duplicated()] # 重複列の除去
+        
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            if col not in hist.columns:
+                return None, f"必要な価格データ ({col}) が見つかりませんでした。"
+
+        # テクニカル指標計算
+        hist['Close'] = pd.to_numeric(hist['Close'], errors='coerce')
         hist['MA5'] = hist['Close'].rolling(window=5).mean()
         hist['MA25'] = hist['Close'].rolling(window=25).mean()
         hist['MA75'] = hist['Close'].rolling(window=75).mean()
         hist['RSI'] = calculate_rsi(hist['Close'])
         hist['High50'] = hist['Close'].rolling(window=50).max()
-        
+
         latest_price = float(hist['Close'].iloc[-1])
-        ma25 = float(hist['MA25'].iloc[-1]) if not pd.isna(hist['MA25'].iloc[-1]) else latest_price
-        ma75 = float(hist['MA75'].iloc[-1]) if not pd.isna(hist['MA75'].iloc[-1]) else latest_price
-        latest_rsi = float(hist['RSI'].iloc[-1]) if not pd.isna(hist['RSI'].iloc[-1]) else 50.0
-        high_50d = float(hist['High50'].iloc[-2]) if len(hist) > 50 and not pd.isna(hist['High50'].iloc[-2]) else latest_price
+        ma25 = float(hist['MA25'].dropna().iloc[-1]) if not hist['MA25'].dropna().empty else latest_price
+        ma75 = float(hist['MA75'].dropna().iloc[-1]) if not hist['MA75'].dropna().empty else latest_price
+        latest_rsi = float(hist['RSI'].dropna().iloc[-1]) if not hist['RSI'].dropna().empty else 50.0
         
-        # 出来高
+        high_50d_series = hist['High50'].dropna()
+        high_50d = float(high_50d_series.iloc[-2]) if len(high_50d_series) >= 2 else latest_price
+
+        # 出来高計算
+        hist['Volume'] = pd.to_numeric(hist['Volume'], errors='coerce')
         latest_volume = float(hist['Volume'].iloc[-1])
         avg_volume_20d = float(hist['Volume'].tail(20).mean())
         vol_change_pct = ((latest_volume - avg_volume_20d) / avg_volume_20d) * 100 if avg_volume_20d > 0 else 0.0
 
-        # ファンダメンタルズ情報取得
+        # ファンダメンタルズ情報
         info = {}
         try:
             info = stock.info or {}
         except Exception:
             pass
 
-        # IR情報
+        company_name = info.get('longName') or info.get('shortName') or symbol
+        per = float(info.get('forwardPE') or info.get('trailingPE') or 0)
+        pbr = float(info.get('priceToBook') or 0)
+        roe = float(info.get('returnOnEquity') or 0) * 100
+        dividend_yield = float(info.get('dividendYield') or 0) * 100
+        revenue_growth = float(info.get('revenueGrowth') or 0) * 100
+        operating_margins = float(info.get('operatingMargins') or 0) * 100
+
+        # IR・ニュース情報
         latest_news_date_str = "データなし"
         days_since_last_ir = None
         try:
@@ -113,15 +128,6 @@ def analyze_stock(symbol, evaluation_mode):
                     days_since_last_ir = (datetime.now() - latest_date).days
         except Exception:
             pass
-
-        # 指標抽出
-        per = float(info.get('forwardPE') or info.get('trailingPE') or 0)
-        pbr = float(info.get('priceToBook') or 0)
-        roe = float(info.get('returnOnEquity') or 0) * 100
-        dividend_yield = float(info.get('dividendYield') or 0) * 100
-        revenue_growth = float(info.get('revenueGrowth') or 0) * 100
-        operating_margins = float(info.get('operatingMargins') or 0) * 100
-        company_name = info.get('longName') or info.get('shortName') or symbol
 
         # スコアリング
         score = 0
@@ -223,7 +229,7 @@ def analyze_stock(symbol, evaluation_mode):
         }, None
 
     except Exception as e:
-        return None, str(e)
+        return None, f"処理エラーが発生しました: {str(e)}"
 
 # --- 画面レイアウト構築 ---
 data, error = analyze_stock(current_symbol, mode)
@@ -231,11 +237,11 @@ data, error = analyze_stock(current_symbol, mode)
 if error:
     st.error(f"エラー: {error}")
 else:
-    # 1. 銘柄ヘッダーと想定期間
+    # 銘柄ヘッダーと想定期間
     st.subheader(f"{data['company_name']} ({current_symbol})")
     st.caption(f"{data['target_period']}")
     
-    # 2. 総合判定カード
+    # 総合判定カード
     if data['judgment_color'] == "green":
         st.success(f"### {data['judgment']} ｜ スコア: {data['score']} 点")
     elif data['judgment_color'] == "orange":
@@ -243,7 +249,7 @@ else:
     else:
         st.error(f"### {data['judgment']} ｜ スコア: {data['score']} 点")
 
-    # 3. 本格ローソク足チャート (証券アプリ風)
+    # 本格ローソク足チャート (証券アプリ風)
     df_chart = data['hist'].tail(90)
     
     fig = make_subplots(
@@ -278,7 +284,7 @@ else:
         marker_color='#ff9800'
     ), row=2, col=1)
 
-    # デザイン設定
+    # チャートデザイン
     fig.update_layout(
         template="plotly_dark",
         height=420,
@@ -290,7 +296,7 @@ else:
     
     st.plotly_chart(fig, use_container_width=True)
 
-    # 4. タブ切り替え
+    # タブ切り替え
     tab1, tab2 = st.tabs(["📊 指標データ", "📝 判定根拠・シグナル"])
 
     with tab1:
