@@ -60,49 +60,67 @@ def calculate_rsi(series, period=14):
 def analyze_stock(symbol, evaluation_mode):
     try:
         stock = yf.Ticker(symbol)
-        info = stock.info
         
-        hist = stock.history(period="6m") # 表示の視認性向上のため直近6ヶ月を取得
-        if hist.empty:
-            return None, "データが取得できませんでした。銘柄コードを確認してください。"
+        # データ取得（エラー回避処理を追加）
+        hist = stock.history(period="6m")
+        if hist is None or hist.empty or len(hist) < 10:
+            return None, f"データが取得できませんでした。銘柄コード ({symbol}) を再確認してください。"
         
-        # 移動平均線
+        # 列構造の平坦化（MultiIndex対策）
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.get_level_values(0)
+            
+        # 必須列の存在確認
+        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        if not all(col in hist.columns for col in required_cols):
+            return None, "必要な価格データ（OHLCV）が含まれていません。"
+
+        # 移動平均線・RSI
         hist['MA5'] = hist['Close'].rolling(window=5).mean()
         hist['MA25'] = hist['Close'].rolling(window=25).mean()
         hist['MA75'] = hist['Close'].rolling(window=75).mean()
         hist['RSI'] = calculate_rsi(hist['Close'])
         hist['High50'] = hist['Close'].rolling(window=50).max()
         
-        latest_price = hist['Close'].iloc[-1]
-        ma5 = hist['MA5'].iloc[-1]
-        ma25 = hist['MA25'].iloc[-1]
-        ma75 = hist['MA75'].iloc[-1]
-        latest_rsi = hist['RSI'].iloc[-1]
-        high_50d = hist['High50'].iloc[-2] if len(hist) > 50 else latest_price
+        latest_price = float(hist['Close'].iloc[-1])
+        ma25 = float(hist['MA25'].iloc[-1]) if not pd.isna(hist['MA25'].iloc[-1]) else latest_price
+        ma75 = float(hist['MA75'].iloc[-1]) if not pd.isna(hist['MA75'].iloc[-1]) else latest_price
+        latest_rsi = float(hist['RSI'].iloc[-1]) if not pd.isna(hist['RSI'].iloc[-1]) else 50.0
+        high_50d = float(hist['High50'].iloc[-2]) if len(hist) > 50 and not pd.isna(hist['High50'].iloc[-2]) else latest_price
         
         # 出来高
-        latest_volume = hist['Volume'].iloc[-1]
-        avg_volume_20d = hist['Volume'].tail(20).mean()
-        vol_change_pct = ((latest_volume - avg_volume_20d) / avg_volume_20d) * 100 if avg_volume_20d > 0 else 0
+        latest_volume = float(hist['Volume'].iloc[-1])
+        avg_volume_20d = float(hist['Volume'].tail(20).mean())
+        vol_change_pct = ((latest_volume - avg_volume_20d) / avg_volume_20d) * 100 if avg_volume_20d > 0 else 0.0
+
+        # ファンダメンタルズ情報取得
+        info = {}
+        try:
+            info = stock.info or {}
+        except Exception:
+            pass
 
         # IR情報
-        news = stock.news
         latest_news_date_str = "データなし"
         days_since_last_ir = None
-        if news and len(news) > 0:
-            pub_time = news[0].get('providerPublishTime')
-            if pub_time:
-                latest_date = datetime.fromtimestamp(pub_time)
-                latest_news_date_str = latest_date.strftime('%Y-%m-%d')
-                days_since_last_ir = (datetime.now() - latest_date).days
+        try:
+            news = stock.news
+            if news and len(news) > 0:
+                pub_time = news[0].get('providerPublishTime')
+                if pub_time:
+                    latest_date = datetime.fromtimestamp(pub_time)
+                    latest_news_date_str = latest_date.strftime('%Y-%m-%d')
+                    days_since_last_ir = (datetime.now() - latest_date).days
+        except Exception:
+            pass
 
-        # 指標
-        per = info.get('forwardPE') or info.get('trailingPE') or 0
-        pbr = info.get('priceToBook') or 0
-        roe = (info.get('returnOnEquity') or 0) * 100
-        dividend_yield = (info.get('dividendYield') or 0) * 100
-        revenue_growth = (info.get('revenueGrowth') or 0) * 100
-        operating_margins = (info.get('operatingMargins') or 0) * 100
+        # 指標抽出
+        per = float(info.get('forwardPE') or info.get('trailingPE') or 0)
+        pbr = float(info.get('priceToBook') or 0)
+        roe = float(info.get('returnOnEquity') or 0) * 100
+        dividend_yield = float(info.get('dividendYield') or 0) * 100
+        revenue_growth = float(info.get('revenueGrowth') or 0) * 100
+        operating_margins = float(info.get('operatingMargins') or 0) * 100
         company_name = info.get('longName') or info.get('shortName') or symbol
 
         # スコアリング
@@ -226,7 +244,7 @@ else:
         st.error(f"### {data['judgment']} ｜ スコア: {data['score']} 点")
 
     # 3. 本格ローソク足チャート (証券アプリ風)
-    df_chart = data['hist'].tail(90) # 直近90日分を表示
+    df_chart = data['hist'].tail(90)
     
     fig = make_subplots(
         rows=2, cols=1, 
@@ -243,14 +261,14 @@ else:
         low=df_chart['Low'],
         close=df_chart['Close'],
         name="株価",
-        increasing_line_color='#ef5350', # 日本の証券ソフト風：陽線は赤
-        decreasing_line_color='#26a69a'  # 陰線は緑
+        increasing_line_color='#ef5350', # 陽線：赤
+        decreasing_line_color='#26a69a'  # 陰線：緑
     ), row=1, col=1)
 
     # 移動平均線
-    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['MA5'], mode='lines', name='MA5(5日)', line=dict(color='#e91e63', width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['MA25'], mode='lines', name='MA25(25日)', line=dict(color='#4caf50', width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['MA75'], mode='lines', name='MA75(75日)', line=dict(color='#2196f3', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['MA5'], mode='lines', name='MA5', line=dict(color='#e91e63', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['MA25'], mode='lines', name='MA25', line=dict(color='#4caf50', width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['MA75'], mode='lines', name='MA75', line=dict(color='#2196f3', width=1.5)), row=1, col=1)
 
     # 出来高
     fig.add_trace(go.Bar(
@@ -260,10 +278,10 @@ else:
         marker_color='#ff9800'
     ), row=2, col=1)
 
-    # チャートデザインの調整（ダークモード風）
+    # デザイン設定
     fig.update_layout(
         template="plotly_dark",
-        height=450,
+        height=420,
         margin=dict(l=10, r=10, t=20, b=10),
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -272,7 +290,7 @@ else:
     
     st.plotly_chart(fig, use_container_width=True)
 
-    # 4. タブ切り替えによる視認性向上
+    # 4. タブ切り替え
     tab1, tab2 = st.tabs(["📊 指標データ", "📝 判定根拠・シグナル"])
 
     with tab1:
